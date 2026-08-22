@@ -11,6 +11,16 @@ workflows:
       - name: Get Flutter packages
         script: flutter pub get
 
+      - name: Scaffold iOS platform folder
+        script: |
+          flutter create . --platforms=ios --org com.mgamesoss
+
+      - name: Add photo library permission
+        script: |
+          plutil -insert NSPhotoLibraryUsageDescription \
+            -string "Manga Rigger needs access to your photos to import cut-up part images." \
+            ios/Runner/Info.plist
+
       - name: Install pods
         script: |
           find . -name "Podfile" -execdir pod install \;
@@ -23,6 +33,7 @@ workflows:
         script: |
           mkdir -p build/ios/ipa_unsigned/Payload
           cp -r build/ios/iphoneos/Runner.app build/ios/ipa_unsigned/Payload/
+          mkdir -p build/ios/ipa
           cd build/ios/ipa_unsigned
           zip -r ../ipa/Runner_unsigned.ipa Payload
     artifacts:
