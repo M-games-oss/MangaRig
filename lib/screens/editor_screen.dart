@@ -13,6 +13,7 @@ import '../widgets/timeline_panel.dart';
 import '../widgets/easing_curve_picker.dart';
 import '../widgets/pivot_point_dialog.dart';
 import '../widgets/blink_helper_dialog.dart';
+import '../widgets/layer_panel.dart';
 
 class EditorScreen extends StatefulWidget {
   final Project project;
@@ -26,6 +27,7 @@ class _EditorScreenState extends State<EditorScreen> {
   late EditorController controller;
   final GlobalKey _repaintKey = GlobalKey();
   bool _exporting = false;
+  bool _showLayerPanel = true;
 
   @override
   void initState() {
@@ -130,6 +132,12 @@ class _EditorScreenState extends State<EditorScreen> {
         title: Text(controller.project.name),
         actions: [
           IconButton(
+            tooltip: 'Layers & rig panel',
+            icon: Icon(Icons.view_list,
+                color: _showLayerPanel ? Colors.deepPurpleAccent : Colors.white54),
+            onPressed: () => setState(() => _showLayerPanel = !_showLayerPanel),
+          ),
+          IconButton(
             tooltip: 'Onion skin',
             icon: Icon(Icons.layers,
                 color: controller.onionSkin ? Colors.deepPurpleAccent : Colors.white54),
@@ -153,21 +161,25 @@ class _EditorScreenState extends State<EditorScreen> {
           ),
         ],
       ),
-      body: Column(
+      body: Row(
         children: [
+          if (_showLayerPanel)
+            SizedBox(width: 220, child: LayerPanel(controller: controller)),
+          if (_showLayerPanel) const VerticalDivider(width: 1, color: Colors.white12),
           Expanded(
-            flex: 5,
-            child: CanvasStage(controller: controller, repaintKey: _repaintKey),
-          ),
-          _buildTransportBar(),
-          if (layer != null) _buildInspector(layer),
-          const Divider(height: 1, color: Colors.white12),
-          Expanded(
-            flex: 4,
-            child: Stack(
+            child: Column(
               children: [
-                TimelinePanel(controller: controller),
-                PlayheadOverlay(controller: controller),
+                Expanded(
+                  flex: 5,
+                  child: CanvasStage(controller: controller, repaintKey: _repaintKey),
+                ),
+                _buildTransportBar(),
+                if (layer != null) _buildInspector(layer),
+                const Divider(height: 1, color: Colors.white12),
+                Expanded(
+                  flex: 4,
+                  child: TimelinePanel(controller: controller),
+                ),
               ],
             ),
           ),
@@ -199,7 +211,8 @@ class _EditorScreenState extends State<EditorScreen> {
                 size: 18, color: controller.loop ? Colors.deepPurpleAccent : Colors.white38),
             onPressed: () => setState(() => controller.loop = !controller.loop),
           ),
-          Text('${(ms / 1000).toStringAsFixed(2)}s / ${(controller.project.durationMs / 1000).toStringAsFixed(1)}s',
+          Text(
+              '${(ms / 1000).toStringAsFixed(2)}s / ${(controller.project.durationMs / 1000).toStringAsFixed(1)}s',
               style: const TextStyle(color: Colors.white54, fontSize: 12)),
           const Spacer(),
           if (controller.selectedLayer != null)
@@ -215,6 +228,7 @@ class _EditorScreenState extends State<EditorScreen> {
 
   Widget _buildInspector(LayerItem layer) {
     final exactKeyframe = keyframeAtExactTime(layer, controller.playheadMs);
+    final pose = poseAt(layer, controller.playheadMs);
     return Container(
       color: const Color(0xFF1B1B20),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
@@ -230,20 +244,22 @@ class _EditorScreenState extends State<EditorScreen> {
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
-              IconButton(
-                tooltip: 'Eye layer marker',
-                icon: Icon(Icons.remove_red_eye,
-                    size: 18, color: layer.isEyeLayer ? Colors.tealAccent : Colors.white30),
-                onPressed: () => controller.toggleEyeLayer(layer),
-              ),
-              TextButton.icon(
-                icon: const Icon(Icons.control_camera, size: 16),
-                label: const Text('Pivot'),
-                onPressed: () => showDialog(
-                  context: context,
-                  builder: (_) => PivotPointDialog(layer: layer, controller: controller),
+              if (!layer.isGroup && !layer.isBone) ...[
+                IconButton(
+                  tooltip: 'Eye layer marker',
+                  icon: Icon(Icons.remove_red_eye,
+                      size: 18, color: layer.isEyeLayer ? Colors.tealAccent : Colors.white30),
+                  onPressed: () => controller.toggleEyeLayer(layer),
                 ),
-              ),
+                TextButton.icon(
+                  icon: const Icon(Icons.control_camera, size: 16),
+                  label: const Text('Pivot'),
+                  onPressed: () => showDialog(
+                    context: context,
+                    builder: (_) => PivotPointDialog(layer: layer, controller: controller),
+                  ),
+                ),
+              ],
               TextButton.icon(
                 icon: const Icon(Icons.visibility, size: 16),
                 label: const Text('Blink'),
@@ -253,12 +269,14 @@ class _EditorScreenState extends State<EditorScreen> {
                 ),
               ),
               IconButton(
-                tooltip: 'Delete layer',
+                tooltip: 'Delete',
                 icon: const Icon(Icons.delete_outline, size: 18, color: Colors.redAccent),
                 onPressed: () => controller.removeLayer(layer.id),
               ),
             ],
           ),
+          if (layer.isBone) _buildBoneLengthSlider(layer),
+          _build3DTiltSliders(layer, pose),
           if (exactKeyframe == null)
             const Padding(
               padding: EdgeInsets.symmetric(vertical: 4),
@@ -275,6 +293,65 @@ class _EditorScreenState extends State<EditorScreen> {
             ),
         ],
       ),
+    );
+  }
+
+  Widget _buildBoneLengthSlider(LayerItem bone) {
+    return Row(
+      children: [
+        const Text('Bone length', style: TextStyle(color: Colors.white54, fontSize: 11)),
+        Expanded(
+          child: Slider(
+            value: bone.boneLength.clamp(20, 400),
+            min: 20,
+            max: 400,
+            onChanged: (v) => controller.setBoneLength(bone, v),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Sliders for the 3D perspective tilt. Deliberately not gesture-driven:
+  /// a touch drag can't unambiguously mean "tilt in 3D" vs "rotate on the
+  /// plane" vs "scale" at the same time, so tilt gets its own explicit
+  /// controls instead of overloading the canvas pinch gesture.
+  Widget _build3DTiltSliders(LayerItem layer, Pose pose) {
+    return Column(
+      children: [
+        Row(
+          children: [
+            const SizedBox(
+              width: 60,
+              child: Text('Tilt X', style: TextStyle(color: Colors.white54, fontSize: 11)),
+            ),
+            Expanded(
+              child: Slider(
+                value: pose.rotationX.clamp(-85, 85),
+                min: -85,
+                max: 85,
+                onChanged: (v) => controller.set3DTilt(layer, rotationX: v, rotationY: pose.rotationY),
+              ),
+            ),
+          ],
+        ),
+        Row(
+          children: [
+            const SizedBox(
+              width: 60,
+              child: Text('Tilt Y', style: TextStyle(color: Colors.white54, fontSize: 11)),
+            ),
+            Expanded(
+              child: Slider(
+                value: pose.rotationY.clamp(-85, 85),
+                min: -85,
+                max: 85,
+                onChanged: (v) => controller.set3DTilt(layer, rotationX: pose.rotationX, rotationY: v),
+              ),
+            ),
+          ],
+        ),
+      ],
     );
   }
 }

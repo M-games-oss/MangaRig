@@ -1,46 +1,62 @@
 import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:vector_math/vector_math_64.dart' show Matrix4, Vector3;
 import '../models.dart';
 import '../editor_controller.dart';
 import '../interpolation.dart';
 
-/// The live preview + rigging surface. One finger drags a part around its
-/// pivot; two fingers pinch/rotate it in place, exactly like most touch
-/// design apps. Every gesture writes (or updates) a keyframe at the current
-/// playhead, so posing on the canvas IS keyframing -- no separate mode.
-class CanvasStage extends StatelessWidget {
+/// The main pose/rig canvas: draws every visible layer at its current
+/// interpolated world pose, draws bone sticks when the skeleton overlay is
+/// on, and turns single-finger drag / two-finger pinch+rotate into pose
+/// changes on the selected layer.
+class CanvasStage extends StatefulWidget {
   final EditorController controller;
   final GlobalKey repaintKey;
-
   const CanvasStage({super.key, required this.controller, required this.repaintKey});
 
   @override
+  State<CanvasStage> createState() => _CanvasStageState();
+}
+
+class _CanvasStageState extends State<CanvasStage> {
+  // Gesture start snapshot for the layer currently being manipulated.
+  Pose? _gestureStartPose;
+  Matrix4? _parentInverseAtGestureStart;
+
+  EditorController get controller => widget.controller;
+  Project get project => controller.project;
+
+  @override
   Widget build(BuildContext context) {
-    final project = controller.project;
     return LayoutBuilder(
       builder: (context, constraints) {
-        return Container(
-          color: const Color(0xFF15151A),
-          alignment: Alignment.center,
+        final scale = math.min(
+          constraints.maxWidth / project.canvasWidth,
+          constraints.maxHeight / project.canvasHeight,
+        );
+        return Center(
           child: RepaintBoundary(
-            key: repaintKey,
-            child: FittedBox(
-              fit: BoxFit.contain,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () => controller.selectLayer(null),
-                child: Container(
+            key: widget.repaintKey,
+            child: SizedBox(
+              width: project.canvasWidth * scale,
+              height: project.canvasHeight * scale,
+              child: Transform.scale(
+                scale: scale,
+                alignment: Alignment.topLeft,
+                child: SizedBox(
                   width: project.canvasWidth,
                   height: project.canvasHeight,
-                  color: Colors.white,
-                  child: Stack(
-                    clipBehavior: Clip.hardEdge,
-                    children: [
-                      if (controller.onionSkin) _buildOnionSkin(),
-                      for (final layer in controller.layersBackToFront)
-                        if (layer.visible) _buildLayer(context, layer),
-                    ],
+                  child: Container(
+                    color: const Color(0xFF1A1A1F),
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        ..._buildOnionSkin(),
+                        ..._buildLayers(),
+                        if (controller.showSkeleton) ..._buildBoneSticks(),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -51,123 +67,137 @@ class CanvasStage extends StatelessWidget {
     );
   }
 
-  Widget _buildOnionSkin() {
-    final ghostTime = math.max(0, controller.playheadMs - 120);
-    return IgnorePointer(
-      child: Opacity(
-        opacity: 0.28,
-        child: Stack(
-          children: [
-            for (final layer in controller.layersBackToFront)
-              if (layer.visible) _positionedLayer(layer, ghostTime, interactive: false),
-          ],
+  List<Widget> _buildOnionSkin() {
+    if (!controller.onionSkin) return [];
+    final prevMs = (controller.playheadMs - 120).clamp(0, project.durationMs);
+    return controller.layersBackToFront
+        .where((l) => l.visible && !l.isGroup && !l.isBone && l.imagePath != null)
+        .map((layer) => Opacity(
+              opacity: 0.25,
+              child: _positionedLayer(layer, prevMs, tint: Colors.blueAccent),
+            ))
+        .toList();
+  }
+
+  List<Widget> _buildLayers() {
+    return controller.layersBackToFront
+        .where((l) => l.visible && !l.isGroup && !l.isBone && l.imagePath != null)
+        .map((layer) => _positionedLayer(layer, controller.playheadMs))
+        .toList();
+  }
+
+  /// Draws a simple stick (line + joint dot) for every bone so the rig is
+  /// visible even when no art is attached yet.
+  List<Widget> _buildBoneSticks() {
+    final bones = project.layers.where((l) => l.isBone).toList();
+    return bones.map((bone) {
+      final world = worldMatrixAt(project, bone, controller.playheadMs);
+      final origin = world.transform3(Vector3(0, 0, 0));
+      final tip = world.transform3(Vector3(bone.boneLength, 0, 0));
+      final selected = controller.selectedLayerId == bone.id;
+      return Positioned.fill(
+        child: IgnorePointer(
+          child: CustomPaint(
+            painter: _BonePainter(
+              origin: Offset(origin.x, origin.y),
+              tip: Offset(tip.x, tip.y),
+              selected: selected,
+            ),
+          ),
+        ),
+      );
+    }).toList();
+  }
+
+  Widget _positionedLayer(LayerItem layer, int timeMs, {Color? tint}) {
+    final world = worldMatrixAt(project, layer, timeMs);
+    final opacity = worldOpacityAt(project, layer, timeMs);
+    final selected = controller.selectedLayerId == layer.id;
+
+    return Positioned(
+      left: 0,
+      top: 0,
+      child: Transform(
+        transform: world,
+        alignment: Alignment.topLeft,
+        child: Opacity(
+          opacity: opacity.clamp(0.0, 1.0),
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: layer.locked ? null : () => controller.selectLayer(layer.id),
+            onScaleStart: layer.locked ? null : (d) => _onScaleStart(layer),
+            onScaleUpdate: layer.locked ? null : (d) => _onScaleUpdate(layer, d),
+            child: Container(
+              width: layer.width,
+              height: layer.height,
+              decoration: selected
+                  ? BoxDecoration(border: Border.all(color: Colors.deepPurpleAccent, width: 2))
+                  : null,
+              child: Image.file(File(layer.imagePath!), fit: BoxFit.fill,
+                  color: tint, colorBlendMode: tint != null ? BlendMode.modulate : null),
+            ),
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildLayer(BuildContext context, LayerItem layer) {
-    return _positionedLayer(layer, controller.playheadMs, interactive: true);
+  void _onScaleStart(LayerItem layer) {
+    controller.selectLayer(layer.id);
+    _gestureStartPose = poseAt(layer, controller.playheadMs);
+
+    // Convert future screen-space drag deltas into this layer's
+    // PARENT-local space by inverting the parent's world matrix. Without
+    // this, dragging a part that's nested inside a rotated group would
+    // move in the wrong direction on screen.
+    final parent = project.byId(layer.parentId);
+    final parentWorld = parent == null
+        ? Matrix4.identity()
+        : worldMatrixAt(project, parent, controller.playheadMs);
+    _parentInverseAtGestureStart = Matrix4.inverted(parentWorld);
   }
 
-  Widget _positionedLayer(LayerItem layer, int timeMs, {required bool interactive}) {
-    final pose = poseAt(layer, timeMs);
-    final isSelected = interactive && layer.id == controller.selectedLayerId;
-    final left = pose.x - layer.pivotX * layer.width;
-    final top = pose.y - layer.pivotY * layer.height;
+  void _onScaleUpdate(LayerItem layer, ScaleUpdateDetails d) {
+    final start = _gestureStartPose;
+    final parentInv = _parentInverseAtGestureStart;
+    if (start == null || parentInv == null) return;
 
-    Widget image = Image.file(
-      File(layer.imagePath),
-      width: layer.width,
-      height: layer.height,
-      fit: BoxFit.fill,
-      errorBuilder: (_, __, ___) => Container(
-        width: layer.width,
-        height: layer.height,
-        color: Colors.pink.withOpacity(0.2),
-      ),
-    );
+    // d.focalPointDelta is a per-frame screen delta; project it into the
+    // parent's local space (ignoring translation, direction only).
+    final localDelta = parentInv.transform3(Vector3(d.focalPointDelta.dx, d.focalPointDelta.dy, 0)) -
+        parentInv.transform3(Vector3.zero());
 
-    Widget transformed = Transform(
-      alignment: FractionalOffset(layer.pivotX, layer.pivotY),
-      transform: Matrix4.identity()
-        ..rotateZ(pose.rotationDeg * math.pi / 180)
-        ..scale(pose.scaleX, pose.scaleY),
-      child: Opacity(
-        opacity: pose.opacity.clamp(0.0, 1.0),
-        child: isSelected
-            ? DecoratedBox(
-                decoration: BoxDecoration(
-                  border: Border.all(color: Colors.deepPurpleAccent, width: 2),
-                ),
-                child: image,
-              )
-            : image,
-      ),
-    );
-
-    if (!interactive || layer.locked) {
-      return Positioned(left: left, top: top, child: transformed);
-    }
-
-    return Positioned(
-      left: left,
-      top: top,
-      child: _DraggableLayer(
-        layer: layer,
-        controller: controller,
-        child: transformed,
-      ),
+    final pose = poseAt(layer, controller.playheadMs);
+    controller.applyLiveTransform(
+      layer,
+      x: pose.x + localDelta.x,
+      y: pose.y + localDelta.y,
+      rotationDeg: start.rotationDeg + (d.rotation * 180 / math.pi),
+      scaleX: (start.scaleX * d.scale).clamp(0.05, 20.0),
+      scaleY: (start.scaleY * d.scale).clamp(0.05, 20.0),
     );
   }
 }
 
-class _DraggableLayer extends StatefulWidget {
-  final LayerItem layer;
-  final EditorController controller;
-  final Widget child;
-  const _DraggableLayer({required this.layer, required this.controller, required this.child});
+class _BonePainter extends CustomPainter {
+  final Offset origin;
+  final Offset tip;
+  final bool selected;
+  _BonePainter({required this.origin, required this.tip, required this.selected});
 
   @override
-  State<_DraggableLayer> createState() => _DraggableLayerState();
-}
-
-class _DraggableLayerState extends State<_DraggableLayer> {
-  Offset _startLocal = Offset.zero;
-  late double _startX, _startY, _startRotation, _startScaleX, _startScaleY;
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = selected ? Colors.orangeAccent : Colors.tealAccent.withOpacity(0.85)
+      ..strokeWidth = selected ? 3 : 2
+      ..style = PaintingStyle.stroke;
+    canvas.drawLine(origin, tip, paint);
+    canvas.drawCircle(origin, 5, Paint()..color = paint.color);
+    canvas.drawCircle(tip, 3, Paint()..color = paint.color.withOpacity(0.6));
+  }
 
   @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () => widget.controller.selectLayer(widget.layer.id),
-      onScaleStart: (details) {
-        widget.controller.selectLayer(widget.layer.id);
-        final pose = poseAt(widget.layer, widget.controller.playheadMs);
-        _startLocal = details.localFocalPoint;
-        _startX = pose.x;
-        _startY = pose.y;
-        _startRotation = pose.rotationDeg;
-        _startScaleX = pose.scaleX;
-        _startScaleY = pose.scaleY;
-      },
-      onScaleUpdate: (details) {
-        final delta = details.localFocalPoint - _startLocal;
-        final newX = _startX + delta.dx;
-        final newY = _startY + delta.dy;
-        final newRotation = _startRotation + details.rotation * 180 / math.pi;
-        final newScaleX = (_startScaleX * details.scale).clamp(0.05, 8.0);
-        final newScaleY = (_startScaleY * details.scale).clamp(0.05, 8.0);
-        widget.controller.applyLiveTransform(
-          widget.layer,
-          x: newX,
-          y: newY,
-          rotationDeg: newRotation,
-          scaleX: newScaleX,
-          scaleY: newScaleY,
-        );
-      },
-      child: widget.child,
-    );
-  }
+  bool shouldRepaint(covariant _BonePainter oldDelegate) =>
+      oldDelegate.origin != origin || oldDelegate.tip != tip || oldDelegate.selected != selected;
 }
+

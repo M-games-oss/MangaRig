@@ -5,6 +5,8 @@ import '../editor_controller.dart';
 
 /// Lets the user drag a crosshair over the part's image to place its pivot
 /// (joint) point -- e.g. the shoulder of an arm, or the hinge of a jaw.
+/// For bone-attached parts, this pivot is where the part rotates around
+/// relative to the bone's own transform.
 class PivotPointDialog extends StatefulWidget {
   final LayerItem layer;
   final EditorController controller;
@@ -63,9 +65,10 @@ class _PivotPointDialogState extends State<PivotPointDialog> {
                 ),
                 child: Stack(
                   children: [
-                    Positioned.fill(
-                      child: Image.file(File(widget.layer.imagePath), fit: BoxFit.contain),
-                    ),
+                    if (widget.layer.imagePath != null)
+                      Positioned.fill(
+                        child: Image.file(File(widget.layer.imagePath!), fit: BoxFit.contain),
+                      ),
                     Positioned(
                       left: px * boxSize - 10,
                       top: py * boxSize - 10,
